@@ -883,9 +883,11 @@ def describeKeyCode (keyCode):
             entry = "UNICODE"
             argument = keyCode & (KEY_SYM_UNICODE-1)
         else:
-            raise ValueError("Invalid parameter: key not found in key table nor recognized as unicode sym.")
+            entry = "Unknown"
+            argument = 0
     # Build the described key code dictionary.
     dkc = {}
+    dkc["keyCode"] = keyCode
     dkc["command"]  = entry
     dkc["argument"] = argument
     dkc["values"]   = ekc

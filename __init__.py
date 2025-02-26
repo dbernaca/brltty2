@@ -6,23 +6,22 @@
 # Copyright (C) 2025 by Dalen Bernaca
 
 """
-This is just a bit boosted brltty driver.
+This is just a bit boosted old NVDA brltty driver.
 """
 
 import os
-import time
-import wx
 import braille
-from logHandler import log
+import brailleInput
+import wx
 import inputCore
+from . import pybrlapi as brlapi
+from logHandler import log
+from time import sleep
 from typing import List
-try:
-	from . import pybrlapi as brlapi
-except ImportError:
-	brlapi = None
 
 class BrailleDisplayDriver(braille.BrailleDisplayDriver):
-	"""brltty braille display driver.
+	"""
+	brltty braille display driver.
 	"""
 	name = "brltty2"
 	description = "brltty2"
@@ -42,15 +41,16 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 		return [pipe.name for pipe in os.scandir("//./pipe/") if pipe.name.startswith(BRLAPI_NAMED_PIPE_PREFIX)]
 
 	@classmethod
-	def check(cls):
-		if not bool(brlapi):
-			return False
+	def check (cls):
 		return True
 
-	def __init__(self):
+	def __init__ (self):
 		super().__init__()
 		self._conn = brlapi.Client("192.168.1.100", auth_callback=lambda m: "nonsense\n", key_callback=self._handleKeyPresses)
 		self._conn.connect()
+		dsp = self.driverName
+		if dsp.lower()!="nobraille":
+			wx.CallLater(80, braille.handler.message, f"{' '.join(dsp.split('_', 1))} over brltty active")
 		self._conn.enterTTYMode()
 		# BRLTTY simulates key presses for braille typing keys, so let BRLTTY handle them.
 		# NVDA may eventually implement this itself, but there's no reason to deny BRLTTY users this functionality in the meantime.
@@ -60,7 +60,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 		super().terminate()
 		try:
 			# Give BRLTTY a chance to write the last piece of data to the display.
-			time.sleep(0.05)
+			sleep(0.05)
 			self._conn.leaveTTYMode()
 			self._conn.close()
 		except:
@@ -74,14 +74,18 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 		self.numCells = nc = self.displaySize[0]
 		return nc
 
-	def _get_numRows(self):
+	def _get_numRows (self):
 		self.numRows = nr = self.displaySize[1]
 		return nr
+
+	def _get_numCols (self):
+		self.numRows = nc = self.displaySize[0]
+		return nc
 
 	def display (self, cells: List[int]):
 		self._conn.writeDots(bytes(cells))
 
-	def _get_driverName(self):
+	def _get_driverName (self):
 		m = "_".join(self._conn.getModelIdentifier().split())
 		self.driverName = dn = self._conn.getDriverName()+("_"+m if m else "")
 		return dn
@@ -93,17 +97,15 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 			return
 		wx.CallAfter(self._onKeyPress, key)
 
-	def _onKeyPress(self, key):
+	def _onKeyPress (self, key):
 		keyType = key["type"]
 		if keyType == "CMD":
-			command = key["command"]
-			argument = key["argument"]
 			try:
-				inputCore.manager.executeGesture(
-					InputGesture(self.driverName, command, argument)
-				)
+				inputCore.manager.executeGesture(InputGesture(self.driverName, key["command"], key["argument"]))
 			except inputCore.NoInputGestureAction:
 				pass
+		else:
+			print(key)
 
 	gestureMap = inputCore.GlobalGestureMap({
 		"globalCommands.GlobalCommands": {
@@ -112,18 +114,17 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 			"braille_previousLine": (f"br({name}):lnup",),
 			"braille_nextLine": (f"br({name}):lndn",),
 			"braille_routeTo": (f"br({name}):route",),
-			"toggleInputHelp": (f"brl({name}):learn"),
-			"showGui": (f"brl({name}):prefmenu",),
-			"revertConfiguration": (f"brl({name}):prefload",),
-			"saveConfiguration": (f"brl({name}):prefsave",),
-			"dateTime": (f"brl({name}):time",),
-			"review_currentLine": (f"brl({name}):say_line",),
-			"review_sayAll": (f"brl({name}):say_below",),
+			"toggleInputHelp": (f"br({name}):learn"),
+			"showGui": (f"br({name}):prefmenu",),
+			"revertConfiguration": (f"br({name}):prefload",),
+			"saveConfiguration": (f"br({name}):prefsave",),
+			"dateTime": (f"br({name}):time",),
+			"review_currentLine": (f"br({name}):say_line",),
+			"review_sayAll": (f"br({name}):say_below",),
 		}
 	})
 
-class InputGesture(braille.BrailleDisplayGesture):
-
+class InputGesture(braille.BrailleDisplayGesture, brailleInput.BrailleInputGesture):
 	source = BrailleDisplayDriver.name
 
 	def __init__(self, model, command, argument):

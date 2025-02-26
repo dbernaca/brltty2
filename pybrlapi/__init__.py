@@ -38,10 +38,13 @@ TODO:
 """
 
 from collections import deque
-from struct import pack, unpack
-from .constants import *
-from .keycodes import *
-from .protocol import *
+from struct      import pack, unpack
+from .constants  import *
+from .keycodes   import *
+from .protocol   import *
+from .blocker    import *
+from .looper     import *
+from .exceptions import *
 import threading
 import os
 
@@ -49,20 +52,7 @@ import os
 # the module does need refreshing, but it is extra useful and writing asynchronous clients and servers
 # with it is extra fast, efficient, readable, connectable to other event loops etc.
 # For deprecation reasons and because NVDA does not pack asyncore a local copy of it is provided
-try:
-    import asyncore
-except:
-    from . import asyncore
-
-class BrlAPIError(Exception):
-    """
-    Custom exception for BrlAPI errors.
-    """
-
-    @classmethod
-    def from_packet (cls, packet):
-        msg = "Received: "+repr(packet)
-        return cls(msg)
+from . import asyncore
 
 class Client(asyncore.dispatcher_with_send):
     """
@@ -70,10 +60,11 @@ class Client(asyncore.dispatcher_with_send):
     Implements most of original BrlAPI's functionalities.
     """
     def __init__ (self, host=DEFAULT_HOST, port=DEFAULT_PORT, auth_callback=None, key_callback=None, error_callback=None):
-        asyncore.dispatcher_with_send.__init__(self)
+        # We need our own specific socket map in case someone else uses asyncore in the same program
+        self.loop = loop = BackgroundLooper()
+        asyncore.dispatcher_with_send.__init__(self, map=loop.connections)
         self.host = host
         self.port = port
-        self.create_socket()
         self.key_callback = key_callback
         if error_callback:
             self.error_callback = error_callback
@@ -91,11 +82,11 @@ class Client(asyncore.dispatcher_with_send):
             k = open("/etc/brlapi.key", "rb").read()
         except Exception as e:
             self.close()
-            self.exception = e
             self.error_callback(e)
-            self.process_lock.release()
+            self.process.throw(e)
 
     def connect (self, runloop=True):
+        self.create_socket()
         try:
             asyncore.dispatcher_with_send.connect(self, (self.host, self.port))
         except Exception as e:
@@ -111,30 +102,14 @@ class Client(asyncore.dispatcher_with_send):
         self.displaySize  = (0, 0)
         self.packetqueue  = deque()
         self.process_func = self.process_handshake
-        self.process_lock = threading.Lock()
-        self.receive_lock = threading.Lock()
+        self.process      = Blocker("Process")
+        self.receive      = Blocker("Receive")
         self.send_lock    = threading.Lock()
-        self.keywait_lock = threading.Lock()
-        self.process_lock.acquire()
+        self.keywait      = Blocker("Keywait")
+        self.process.begin()
         if runloop:
-            def loopy ():
-                try:
-                    asyncore.loop()
-                except OSError:
-                    pass
-                print("asyncore.loop() ended")
-            self.looper = t = threading.Thread(target=loopy)
-            t.daemon = True
-            t.start()
-        self.process_lock.acquire()
-        self.process_lock.release()
-        self._excheck()
-
-    def _excheck (self):
-        if self.exception:
-            e = self.exception
-            self.exception = None
-            raise e
+            self.loop.start()
+        self.process.wait()
 
     def handle_connect (self):
         """Called when the connection is established."""
@@ -144,10 +119,7 @@ class Client(asyncore.dispatcher_with_send):
         """Handle socket closure."""
         print("[BrlAPI] Connection closing.")
         self.close()
-        try:
-            self.process_lock.release()
-        except:
-            pass
+        self.process.done()
 
     def handle_read (self):
         """
@@ -191,19 +163,24 @@ class Client(asyncore.dispatcher_with_send):
         try:
             packet = Packet.from_bytes(b)
         except Exception as e:
-            self.exception = BrlAPIError("Unable to interpret a packet during the handshake: "+str(e))
-            self.error_callback(self.exception)
-            self.process_lock.release()
+            e = BrlAPIError("Unable to interpret a packet during the handshake: "+str(e))
+            self.error_callback(e)
+            self.process.throw(e)
             return
         #print("Server: "+str(packet))
         if packet.isError():
             self.close()
-            self.exception = e = BrlAPIError.from_packet(packet)
+            e = BrlAPIError.from_packet(packet)
             self.error_callback(e)
-            self.process_lock.release()
+            self.throw(e)
             return
         if packet.isVersion():
             self.step = 1
+            if packet.protocol<PROTOCOL_VERSION:
+                e = BrlAPIError("brltty on the other side does not speak protocol %i. It declared %i, which is too low for pybrlapi." % (PROTOCOL_VERSION, packet.protocol))
+                self.error_callback(e)
+                self.process.throw(e)
+                return
             self.send(VersionPacket())
         elif packet.isAuth():
             self.step = 2
@@ -219,23 +196,23 @@ class Client(asyncore.dispatcher_with_send):
                 self.auth_callback(AUTH_NONE)
                 self.mode         = "normal"
                 self.process_func = self.process_data
-                self.process_lock.release()
+                self.process.done()
             else:
                 self.close()
-                self.exception = e = BrlAPIError("This port of BRLAPI supports only AUTH_NONE and AUTH_KEY authentication methods, %s requested" % ("AUTH_CRED" if packet.method==AUTH_CRED else str(packet.method)))
+                e = BrlAPIError("This port of BRLAPI supports only AUTH_NONE and AUTH_KEY authentication methods, %s requested" % ("AUTH_CRED" if packet.method==AUTH_CRED else str(packet.method)))
                 self.error_callback(e)
-                self.process_lock.release()
+                self.process.throw(e)
                 return
         elif packet.isACK():
             self.step = 3
             self.mode         = "normal"
             self.process_func = self.process_data
-            self.process_lock.release()
+            self.process.done()
         else:
             self.close()
-            self.exception = e = BrlAPIError("Unexpected packet arrived during handshake.")
+            e = BrlAPIError("Unexpected packet arrived during handshake.")
             self.error_callback(e)
-            self.process_lock.release()
+            self.process.throw()
             return
         # If there is already a next packet, process it as well
         if self.in_buffer:
@@ -266,18 +243,14 @@ class Client(asyncore.dispatcher_with_send):
                 self.key_callback(packet)
             else:
                 self.packetqueue.append(packet)
-                try:
-                    self.keywait_lock.release()
-                except:
-                    pass
+                self.keywait.done()
         elif packet.isError():
             self.exception = e = BrlAPIError.from_packet(packet)
             self.error_callback(e)
+            # An error could arrive during the key wait, so do not wait for it any more
+            self.keywait.done()
         if not packet.isKey():
-            try:
-                self.receive_lock.release()
-            except:
-                pass
+            self.receive.done()
         # Process the next packet if waiting
         if self.in_buffer:
             self.process_func()
@@ -286,34 +259,41 @@ class Client(asyncore.dispatcher_with_send):
         data = Packet(data) if isinstance(data, int) else data
         #print("Client: "+repr(data))
         data = data.to_bytes() if isinstance(data, Packet) else data
-        if blocking:
-            self.receive_lock.acquire()
         with self.send_lock:
+            if blocking:
+                self.receive.prepare()
             asyncore.dispatcher_with_send.send(self, data)
-        if blocking:
-            self.receive_lock.acquire()
-            self.receive_lock.release()
+            if blocking:
+                self.receive.wait()
 
     def getDriverName (self):
-        with self.process_lock:
-            self.send(Packet(PACKET_GETDRIVERNAME), blocking=True)
-        self._excheck()
+        with self.process:
+            self.send(PACKET_GETDRIVERNAME, blocking=True)
         return self.driver
 
     def getModelIdentifier (self):
-        with self.process_lock:
+        with self.process:
             self.send(PACKET_GETMODELID, blocking=True)
-        self._excheck()
         return self.model
 
     def getDisplaySize (self):
-        with self.process_lock:
+        with self.process:
             self.send(PACKET_GETDISPLAYSIZE, blocking=True)
-        self._excheck()
         return self.displaySize
 
     def enterTTYMode (self, ttys=DEFAULT_TTY, driver=""):
-        """Request control of a specific TTY."""
+        """
+        Request control of a specific TTY.
+        The ttys is a TTY number of which the app will be taking control over, or a sequence of TTY numbers leading to, and including,
+        the TTY the app will be taking control over. brltty will continue its usual operation when user switches to other TTYs.
+        The driver argument selects key reporting mode.
+        If "" (which is default), then brltty's universal commands are returned.
+        If driver name is given, as returned by getDriverName(), then the
+        driver specific codes are returned instead.
+        If driver is None, then getDriverName() is called to get the driver name.
+        """
+        if self.mode!="normal":
+            raise BrlAPIError("Not permitted in %s mode" % self.mode)
         ttys = (0,) if ttys==DEFAULT_TTY else ttys
         ttys = (ttys,) if isinstance(ttys, int) else ttys
         payload = pack("!I" +(len(ttys)*"I"), len(ttys), *ttys)
@@ -321,16 +301,18 @@ class Client(asyncore.dispatcher_with_send):
             driver = self.getDriverName()
         driver = driver.encode("ASCII") if isinstance(driver, str) else driver
         payload += pack("!B", len(driver))+driver
-        with self.process_lock:
+        with self.process:
             self.send(Packet(PACKET_ENTERTTYMODE, payload), blocking=True)
-        self._excheck()
         self.mode = "TTY:"+str(ttys[-1])
 
     def leaveTTYMode (self):
-        """Release control of the current TTY."""
-        with self.process_lock:
+        """
+        Release control of the current TTY.
+        """
+        if not self.mode.startswith("TTY"):
+            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+        with self.process:
             self.send(PACKET_LEAVETTYMODE, blocking=True)
-        self._excheck()
         self.mode = "normal"
 
     def writeText (self, text, encoding="UTF-8", cursor=CURSOR_OFF):
@@ -394,15 +376,13 @@ class Client(asyncore.dispatcher_with_send):
             self.packetqueue.clear()
             raise BrlAPIError("Not permitted in %s mode" % self.mode)
         if blocking and not self.packetqueue:
-            self.keywait_lock.acquire()
-            with self.keywait_lock:
-                return self.packetqueue.pop()
+            self.keywait.wait()
         try:
             return self.packetqueue.pop()
         except:
             pass
 
-    def close(self):
+    def close (self):
         """Close the connection properly."""
-        super().close()
+        asyncore.dispatcher_with_send.close(self)
         print("[BrlAPI] Connection closed.")
