@@ -120,6 +120,7 @@ class Client(asyncore.dispatcher_with_send):
         print("[BrlAPI] Connection closing.")
         self.close()
         self.process.done()
+        self.loop.stop()
 
     def handle_read (self):
         """
@@ -262,7 +263,13 @@ class Client(asyncore.dispatcher_with_send):
         with self.send_lock:
             if blocking:
                 self.receive.prepare()
-            asyncore.dispatcher_with_send.send(self, data)
+            try:
+                asyncore.dispatcher_with_send.send(self, data)
+            except Exception as e:
+                self.close()
+                if blocking:
+                    self.receive.throw(e)
+                raise
             if blocking:
                 self.receive.wait()
 
