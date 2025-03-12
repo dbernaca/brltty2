@@ -14,10 +14,15 @@ import braille
 import brailleInput
 import wx
 import inputCore
+import nvwave
 from . import pybrlapi as brlapi
 from logHandler import log
 from time import sleep
 from typing import List
+
+MyPath = os.path.dirname(os.path.abspath(__file__))
+SOUND_CONNECTED    = os.path.join(MyPath, "sounds", "BDConnected.wav")
+SOUND_DISCONNECTED = os.path.join(MyPath, "sounds", "BDDisconnected.wav")
 
 class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 	"""
@@ -50,7 +55,8 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 		self._conn.connect()
 		dsp = self.driverName
 		if dsp.lower()!="nobraille":
-			wx.CallLater(80, braille.handler.message, f"{' '.join(dsp.split('_', 1))} over brltty active")
+			wx.CallLater(40, nvwave.playWaveFile, SOUND_CONNECTED)
+			wx.CallLater(80, braille.handler.message, f"{' '.join(dsp.split('_', 1))} over brltty at {self._conn.host}:{self._conn.port}")
 		self._conn.enterTTYMode()
 		# BRLTTY simulates key presses for braille typing keys, so let BRLTTY handle them.
 		# NVDA may eventually implement this itself, but there's no reason to deny BRLTTY users this functionality in the meantime.
@@ -79,11 +85,14 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 		return nr
 
 	def _get_numCols (self):
-		self.numRows = nc = self.displaySize[0]
+		self.numCols = nc = self.displaySize[0]
 		return nc
 
 	def display (self, cells: List[int]):
-		self._conn.writeDots(bytes(cells))
+		try:
+			self._conn.writeDots(bytes(cells))
+		except:
+			nvwave.playWaveFile(SOUND_DISCONNECTED)
 
 	def _get_driverName (self):
 		m = "_".join(self._conn.getModelIdentifier().split())
@@ -127,7 +136,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 class InputGesture(braille.BrailleDisplayGesture, brailleInput.BrailleInputGesture):
 	source = BrailleDisplayDriver.name
 
-	def __init__(self, model, command, argument):
+	def __init__ (self, model, command, argument):
 		super().__init__()
 		self.model = model
 		self.id = command.lower()

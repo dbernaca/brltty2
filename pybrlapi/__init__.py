@@ -113,14 +113,13 @@ class Client(asyncore.dispatcher_with_send):
 
     def handle_connect (self):
         """Called when the connection is established."""
-        print("[BrlAPI] Connected to BRLTTY.")
+        print("Connected to BRLTTY.")
 
     def handle_close (self):
         """Handle socket closure."""
-        print("[BrlAPI] Connection closing.")
+        print("Connection closing.")
         self.close()
         self.process.done()
-        self.loop.stop()
 
     def handle_read (self):
         """
@@ -200,12 +199,12 @@ class Client(asyncore.dispatcher_with_send):
                 self.process.done()
             else:
                 self.close()
-                e = BrlAPIError("This port of BRLAPI supports only AUTH_NONE and AUTH_KEY authentication methods, %s requested" % ("AUTH_CRED" if packet.method==AUTH_CRED else str(packet.method)))
+                e = BrlAPIError("This port of BrlAPI supports only AUTH_NONE and AUTH_KEY authentication methods, %s requested" % ("AUTH_CRED" if packet.method==AUTH_CRED else str(packet.method)))
                 self.error_callback(e)
                 self.process.throw(e)
                 return
         elif packet.isACK():
-            self.step = 3
+            self.step         = 3
             self.mode         = "normal"
             self.process_func = self.process_data
             self.process.done()
@@ -390,6 +389,8 @@ class Client(asyncore.dispatcher_with_send):
             pass
 
     def close (self):
-        """Close the connection properly."""
+        """
+        Close the connection properly.
+        """
         asyncore.dispatcher_with_send.close(self)
-        print("[BrlAPI] Connection closed.")
+        print("Connection closed.")
