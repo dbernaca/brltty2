@@ -15,6 +15,7 @@ import brailleInput
 import wx
 import inputCore
 import nvwave
+from speech import speakMessage
 from . import pybrlapi as brlapi
 from logHandler import log
 from time import sleep
@@ -51,16 +52,22 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 
 	def __init__ (self):
 		super().__init__()
-		self._conn = brlapi.Client("192.168.1.100", auth_callback=lambda m: "nonsense\n", key_callback=self._handleKeyPresses)
+		self._conn = brlapi.Client("192.168.1.100",
+			auth_callback=lambda m: "nonsense\n",
+			key_callback=self._handleKeyPresses,
+			info_callback=self._device_pulse)
 		self._conn.connect()
+		self.device_present = False
 		dsp = self.driverName
 		if dsp.lower()!="nobraille":
+			self.device_present = True
 			wx.CallLater(40, nvwave.playWaveFile, SOUND_CONNECTED)
 			wx.CallLater(80, braille.handler.message, f"{' '.join(dsp.split('_', 1))} over brltty at {self._conn.host}:{self._conn.port}")
 		self._conn.enterTTYMode()
 		# BRLTTY simulates key presses for braille typing keys, so let BRLTTY handle them.
 		# NVDA may eventually implement this itself, but there's no reason to deny BRLTTY users this functionality in the meantime.
 		#self._conn.ignoreKeys(brlapi.rangeType_type, (brlapi.KEY_TYPE_SYM,))
+		self._conn.loop.add_timer(1.5, self._conn.send, (brlapi.PACKET_GETMODELID,))
 
 	def terminate(self):
 		super().terminate()
@@ -71,6 +78,20 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 			self._conn.close()
 		except:
 			pass
+
+	def _device_pulse (self, type, info):
+		if type!=brlapi.PACKET_GETMODELID:
+			return
+		changed = info!=self._conn.model
+		if changed and self.device_present:
+			self.device_present = False
+			wx.CallAfter(nvwave.playWaveFile, SOUND_DISCONNECTED)
+			wx.CallAfter(wx.CallLater, 80, speakMessage, "Braille display disconnected")
+			return
+		if changed and not self.device_present:
+			self.device_present = True
+			wx.CallAfter(nvwave.playWaveFile, SOUND_CONNECTED)
+			wx.CallAfter(wx.CallLater, 50, braille.handler.message, f"{' '.join(info.split('_', 1))} over brltty at {self._conn.host}:{self._conn.port}")
 
 	def _get_displaySize (self):
 		self.displaySize = ds = self._conn.getDisplaySize()

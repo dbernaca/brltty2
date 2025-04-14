@@ -34,8 +34,12 @@ class Packet:
             raise ValueError("Packet too short (No header)")
         size, type = unpack("!II", data[:8])
         # Extract payload
-        if len(data)-8!=size:
+        ppl = len(data)-8
+        if ppl>size:
             print("Warning: Packet overflow!")
+        elif ppl<size and type!=PACKET_VERSION:
+            # PACKET_VERSION can arrive malformed if brltty is serving another client
+            print("Warning: Packet payload missing!")
         payload = data[8:size+8]
         return packet_classes.get(type, cls)(type, payload)
 
@@ -68,8 +72,9 @@ class VersionPacket(Packet):
     For now this is only version 8.
     """
     def __init__ (self, type=PACKET_VERSION, protocol=PROTOCOL_VERSION):
-        protocol = protocol if isinstance(protocol, int) else unpack("!I", protocol)[0]
-        payload = pack("!I", protocol)
+        protocol = protocol if isinstance(protocol, int) \
+                   else (unpack("!I", protocol)[0] if protocol else -1)
+        payload = b"" if protocol<0 else pack("!I", protocol)
         Packet.__init__(self, type, payload)
         self.protocol = protocol
 

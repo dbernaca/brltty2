@@ -30,7 +30,6 @@ please continue your excellent work and don't be angry at me because of this lit
 
 TODO:
  * Ensure no freezes are possible because of any reason (introduce timeouts and so on)
- * Implement a special lock for waiting and managing exceptions (all in one)
  * Implement autodetection of every brltty serving BrlAPI in a local network
  * See how to detect braille display disconnect or change (poll using PACKET_GETDRIVERNAME or something)
  * Improve BrlAPIError() exception class
@@ -51,7 +50,7 @@ import os
 # asyncore is on its way of being deprecated in favour of asyncio which is a complete nonsense
 # the module does need refreshing, but it is extra useful and writing asynchronous clients and servers
 # with it is extra fast, efficient, readable, connectable to other event loops etc.
-# For deprecation reasons and because NVDA does not pack asyncore a local copy of it is provided
+# For deprecation reasons and because NVDA screen reader does not pack asyncore a local copy of it is provided
 from . import asyncore
 
 class Client(asyncore.dispatcher_with_send):
@@ -59,17 +58,21 @@ class Client(asyncore.dispatcher_with_send):
     A BrlAPI client that talks to brltty.
     Implements most of original BrlAPI's functionalities.
     """
-    def __init__ (self, host=DEFAULT_HOST, port=DEFAULT_PORT, auth_callback=None, key_callback=None, error_callback=None):
+    def __init__ (self, host=DEFAULT_HOST, port=DEFAULT_PORT, auth_callback=None, key_callback=None, info_callback=None, error_callback=None):
         # We need our own specific socket map in case someone else uses asyncore in the same program
-        self.loop = loop = BackgroundLooper()
+        self.loop = loop = BackgroundLooper(timeout=0.25)
         asyncore.dispatcher_with_send.__init__(self, map=loop.connections)
         self.host = host
         self.port = port
         self.key_callback = key_callback
+        if info_callback:
+            self.info_callback = info_callback
         if error_callback:
             self.error_callback = error_callback
         if auth_callback:
             self.auth_callback = auth_callback
+
+    info_callback  = lambda self, type, info: None
 
     error_callback = lambda self, error: None
 
@@ -86,11 +89,12 @@ class Client(asyncore.dispatcher_with_send):
             self.process.throw(e)
 
     def connect (self, runloop=True):
-        self.create_socket()
+        if self.connected:
+            return
         try:
+            self.create_socket()
             asyncore.dispatcher_with_send.connect(self, (self.host, self.port))
         except Exception as e:
-            self.exception = e
             self.error_callback(e)
             raise
         self.in_buffer    = b""
@@ -139,12 +143,12 @@ class Client(asyncore.dispatcher_with_send):
             size = unpack("!I", b[:4])[0]+8
         except:
             self.close()
-            e = BrlAPIError("Probably not brltty on the other side")
+            e = BrlAPIError(ERROR_INVALID_PARAMETER, "Probably not brltty on the other side")
             self.error_callback(e)
             raise e
         if size>MAX_PACKET_SIZE:
             self.close()
-            e = BrlAPIError("Header indicates packet size bigger than MAX_PACKET_SIZE, this is not brltty talking for sure")
+            e = BrlAPIError(ERROR_INVALID_PACKET, "Header indicates packet size bigger than MAX_PACKET_SIZE, this is not brltty talking for sure")
             self.error_callback(e)
             raise e
         l = len(b)
@@ -156,15 +160,21 @@ class Client(asyncore.dispatcher_with_send):
         return b[:size]
 
     def process_handshake (self):
-        b = self.process_buffer()
+        try:
+            b = self.process_buffer()
+        except Exception as e:
+            self.receive.done()
+            self.process.throw(e)
+            return
         if b is None:
             # No packet in the buffer yet
             return
         try:
             packet = Packet.from_bytes(b)
         except Exception as e:
-            e = BrlAPIError("Unable to interpret a packet during the handshake: "+str(e))
+            e = BrlAPIError(ERROR_INVALID_PARAMETER, "Unable to interpret a packet during the handshake: "+str(e))
             self.error_callback(e)
+            self.receive.done()
             self.process.throw(e)
             return
         #print("Server: "+str(packet))
@@ -172,13 +182,16 @@ class Client(asyncore.dispatcher_with_send):
             self.close()
             e = BrlAPIError.from_packet(packet)
             self.error_callback(e)
-            self.throw(e)
+            self.receive.done()
+            self.process.throw(e)
             return
         if packet.isVersion():
             self.step = 1
             if packet.protocol<PROTOCOL_VERSION:
-                e = BrlAPIError("brltty on the other side does not speak protocol %i. It declared %i, which is too low for pybrlapi." % (PROTOCOL_VERSION, packet.protocol))
+                self.close()
+                e = BrlAPIError(ERROR_PROTOCOL_VERSION, "brltty on the other side does not speak protocol %i. It declared %i, which is too low for pybrlapi." % (PROTOCOL_VERSION, packet.protocol))
                 self.error_callback(e)
+                self.receive.done()
                 self.process.throw(e)
                 return
             self.send(VersionPacket())
@@ -199,8 +212,9 @@ class Client(asyncore.dispatcher_with_send):
                 self.process.done()
             else:
                 self.close()
-                e = BrlAPIError("This port of BrlAPI supports only AUTH_NONE and AUTH_KEY authentication methods, %s requested" % ("AUTH_CRED" if packet.method==AUTH_CRED else str(packet.method)))
+                e = BrlAPIError(ERROR_OPNOTSUPP, "This port of BrlAPI supports only AUTH_NONE and AUTH_KEY authentication methods, %s requested" % ("AUTH_CRED" if packet.method==AUTH_CRED else str(packet.method)))
                 self.error_callback(e)
+                self.receive.done()
                 self.process.throw(e)
                 return
         elif packet.isACK():
@@ -210,34 +224,43 @@ class Client(asyncore.dispatcher_with_send):
             self.process.done()
         else:
             self.close()
-            e = BrlAPIError("Unexpected packet arrived during handshake.")
+            e = BrlAPIError(ERROR_UNKNOWN_INSTRUCTION, "Unexpected packet arrived during handshake.")
             self.error_callback(e)
-            self.process.throw()
+            self.receive.done()
+            self.process.throw(e)
             return
         # If there is already a next packet, process it as well
         if self.in_buffer:
             self.process_func()
 
     def process_data (self):
-        b = self.process_buffer()
+        try:
+            b = self.process_buffer()
+        except Exception as e:
+            self.receive.done()
+            self.process.throw(e)
+            return
         if b is None:
             # Wait for a packet, buffer is empty
             return
         try:
             packet = Packet.from_bytes(b)
         except Exception as e:
-            self.exception = e = BrlAPIError("Unable to deserialize packet: "+str(e))
+            e = BrlAPIError(ERROR_INVALID_PARAMETER, "Unable to deserialize packet: "+str(e))
             self.error_callback(e)
             # Wait for a next one, perhaps something funny happened
             return
         #print("Server: "+str(packet))
         if packet.isInfo():
-            if packet.type==PACKET_GETDRIVERNAME:
-                self.driver = packet.info
-            elif packet.type==PACKET_GETMODELID:
-                self.model = packet.info
-            elif packet.type==PACKET_GETDISPLAYSIZE:
-                self.displaySize = packet.info
+            type = packet.type
+            info = packet.info
+            if type==PACKET_GETDRIVERNAME:
+                self.driver = info
+            elif type==PACKET_GETMODELID:
+                self.model = info
+            elif type==PACKET_GETDISPLAYSIZE:
+                self.displaySize = info
+            self.info_callback(type, info)
         elif packet.isKey():
             if self.key_callback:
                 self.key_callback(packet)
@@ -245,7 +268,7 @@ class Client(asyncore.dispatcher_with_send):
                 self.packetqueue.append(packet)
                 self.keywait.done()
         elif packet.isError():
-            self.exception = e = BrlAPIError.from_packet(packet)
+            e = BrlAPIError.from_packet(packet)
             self.error_callback(e)
             # An error could arrive during the key wait, so do not wait for it any more
             self.keywait.done()
@@ -264,11 +287,12 @@ class Client(asyncore.dispatcher_with_send):
                 self.receive.prepare()
             try:
                 asyncore.dispatcher_with_send.send(self, data)
-            except Exception as e:
+            except:
                 self.close()
+                e = BrlAPIError(ERROR_CONNREFUSED, "A connection to brltty broke")
                 if blocking:
                     self.receive.throw(e)
-                raise
+                raise e
             if blocking:
                 self.receive.wait()
 
@@ -299,7 +323,7 @@ class Client(asyncore.dispatcher_with_send):
         If driver is None, then getDriverName() is called to get the driver name.
         """
         if self.mode!="normal":
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         ttys = (0,) if ttys==DEFAULT_TTY else ttys
         ttys = (ttys,) if isinstance(ttys, int) else ttys
         payload = pack("!I" +(len(ttys)*"I"), len(ttys), *ttys)
@@ -316,14 +340,14 @@ class Client(asyncore.dispatcher_with_send):
         Release control of the current TTY.
         """
         if not self.mode.startswith("TTY"):
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         with self.process:
             self.send(PACKET_LEAVETTYMODE, blocking=True)
         self.mode = "normal"
 
     def writeText (self, text, encoding="UTF-8", cursor=CURSOR_OFF):
         if not self.mode.startswith("TTY"):
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         fmt = "!II%is" # flags, len(bytes(text)), bytes(text)
         flags = WF_TEXT|WF_CHARSET
         text = text.encode(encoding)
@@ -343,7 +367,7 @@ class Client(asyncore.dispatcher_with_send):
 
     def writeDots (self, content):
         if not self.mode.startswith("TTY"):
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         if self.displaySize==(0, 0):
             self.getDisplaySize()
         size = self.displaySize[0]*self.displaySize[1]
@@ -357,7 +381,7 @@ class Client(asyncore.dispatcher_with_send):
 
     def writeRegion (self, content, start=1, cursor=CURSOR_OFF):
         if not self.mode.startswith("TTY"):
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         flags = WF_REGION|WF_TEXT
         fmt = "!IIII%is" % len(content)
         args = [0, start, len(content),  len(content), content]
@@ -371,7 +395,7 @@ class Client(asyncore.dispatcher_with_send):
 
     def setCursor (self, cursor):
         if not self.mode.startswith("TTY"):
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         if cursor<0:
             return
         payload = pack("!II", WF_CURSOR, cursor)
@@ -380,7 +404,7 @@ class Client(asyncore.dispatcher_with_send):
     def readKey (self, blocking=True):
         if not self.mode.startswith("TTY"):
             self.packetqueue.clear()
-            raise BrlAPIError("Not permitted in %s mode" % self.mode)
+            raise BrlAPIError(ERROR_ILLEGAL_INSTRUCTION, "Not permitted in %s mode" % self.mode)
         if blocking and not self.packetqueue:
             self.keywait.wait()
         try:

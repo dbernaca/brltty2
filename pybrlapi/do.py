@@ -1,10 +1,18 @@
 from threading import Thread
+from .exceptions import Interrupted
+from time import sleep
+
+try:
+    from multiprocessing import cpu_count
+except:
+    cpu_count = lambda: 1
 
 class BasicTask:
-    def __init__ (self, func, args=(), kwargs={}):
+    def __init__ (self, func, args=(), kwargs={}, delay=0.0):
         self.func   = func
         self.args   = args
         self.kwargs = kwargs
+        self.delay  = delay
         self.name   = func.__name__
         self.done   = False
         self.res    = Ellipsis
@@ -23,7 +31,10 @@ class BasicTask:
 
     def run (self):
         try:
+            sleep(self.delay)
             self.res = self.func(*self.args, **self.kwargs)
+        except (InterruptedError, KeyboardInterrupt):
+            self.exc = Interrupted("Task() interrupted via signal")
         except Exception as e:
             self.exc = e
         self.done = True
@@ -46,10 +57,11 @@ class BasicTask:
     __call__ = retrieve
 
 class Task (BasicTask, Thread):
-    def __init__ (self, func, args=(), kwargs={}):
-        Thread.__init__(self)
+    name = None # Just override Thread.name property
+    def __init__ (self, func, args=(), kwargs={}, delay=0.0):
+        BasicTask.__init__(self, func, args, kwargs, delay)
+        Thread.__init__(self, name=func.__name__)
         self.daemon = True
-        BasicTask.__init__(self, func, args, kwargs)
 
     def start (self):
         Thread.start(self)
@@ -77,7 +89,7 @@ class Task (BasicTask, Thread):
     __hash__ = BasicTask.__hash__
 
 class RepeatableTask (BasicTask):
-    def __init__ (self, func, args=(), kwargs={}):
+    def __init__ (self, func, args=(), kwargs={}, delay=0.0):
         self.func   = func
         self.args   = args
         self.kwargs = kwargs
@@ -85,12 +97,13 @@ class RepeatableTask (BasicTask):
         self.res    = Ellipsis
         self.exc    = None
         self.task   = None
+        self.delay = delay
 
     def start (self):
         if self.task:
             if not self.task.done:
                 return self
-        self.task = task = Task(self.func, self.args, self.kwargs)
+        self.task = task = Task(self.func, self.args, self.kwargs, self.delay)
         task.on_done = self.on_done
         task.start()
         return self
@@ -114,5 +127,22 @@ class RepeatableTask (BasicTask):
 
 def map (func, seq, error="return"):
     q = [Task(func, (arg,)).start() for arg in seq]
+    return (task(error=error) for task in q)
+
+def gmap (func, seq, batch=(2*cpu_count()), delay=0.0, error="return"):
+    q = []
+    x = 1
+    ls = len(seq)
+    for tn, arg in enumerate(seq, 1):
+        q.append(Task(func, (arg,)).start())
+        if x==batch:
+            for task in q:
+                yield task(error=error)
+            if tn==ls:
+                return
+            x = 0
+            q = []
+            sleep(delay)
+        x += 1
     for task in q:
         yield task(error=error)
